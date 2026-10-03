@@ -16,7 +16,8 @@ expose une base PostgreSQL comme un système de fichiers Hurd, afin
 que les autres translators — en premier lieu
 [orchestrator-translator](https://github.com/gnu-ai/orchestrator-translator)
 — écrivent et relisent leurs données (données d'entraînement,
-exécutions, résultats, incidents, clés d'accès du mode distant
+exécutions, résultats, incidents, registre des clés publiques SSH du
+mode distant
 d'[inference-translator](https://github.com/gnu-ai/inference-translator))
 par de simples `write`/`read` POSIX, sans jamais lier une
 bibliothèque cliente SQL ni ouvrir de socket vers le serveur.
@@ -35,9 +36,9 @@ translator dédié, la persistance ne fait que **stocker et servir**.
 |---|---|---|
 | `orchestrator-translator` | coordination : scheduler, supervisor, evaluator, aggregator ; écrit et lit via `/db` | gnu-ai/orchestrator-translator |
 | `neuron-translator` | unité de calcul : réseau sigmoïde feedforward, piloté par POSIX | gnu-ai/neuron-translator |
-| `inference-translator` | interface de dialogue : prompts, requêtes structurées, mode distant authentifié par clé | gnu-ai/inference-translator |
+| `inference-translator` | interface de dialogue : prompts, requêtes structurées, mode distant authentifié par clé SSH | gnu-ai/inference-translator |
 | `httpfs-translator` | transport pur HTTP → système de fichiers (`content`, `headers`, `status`) | gnu-ai/httpfs-translator |
-| `data-base-translator` | persistance PostgreSQL : données d'entraînement, exécutions, résultats, historique, clés d'accès | ce dépôt |
+| `data-base-translator` | persistance PostgreSQL : données d'entraînement, exécutions, résultats, historique, clés SSH | ce dépôt |
 
 ### Ce que ce translator garantit aux autres
 
@@ -49,9 +50,9 @@ translator dédié, la persistance ne fait que **stocker et servir**.
   BDD" ne peut se creuser dans la pile.
 - **Rejouabilité** : ce qui a été acquis sur le réseau ou calculé
   peut être relu plus tard, à l'identique, réseau coupé.
-- **Secrets jamais en clair** : les clés d'accès du mode distant
-  d'`inference-translator` ne sont stockées que hachées
-  (SHA-256) ; le translator hache, la base ne voit jamais la clé.
+- **Clés privées jamais vues** : le registre du mode distant
+  d'`inference-translator` ne stocke que des **clés publiques SSH**
+  et leurs empreintes ; une clé privée ne traverse jamais `/db`.
 
 ### Ce qu'il ne fait pas
 
@@ -61,9 +62,10 @@ translator dédié, la persistance ne fait que **stocker et servir**.
   `TEXT` opaque, y compris une page d'erreur 404.
 - Pas de décision sur les données : un doublon (`checksum`) est
   signalé à l'appelant, jamais silencieusement écrasé ni ignoré.
-- Pas de décision d'autorisation : il rend un statut de clé
-  (`valid`, `revoked`, `unknown`), c'est au serveur
-  `inference` d'accepter ou de refuser la connexion.
+- Pas de décision d'autorisation : il sert le registre des clés
+  publiques ; c'est sshd (via `authorized_keys` généré depuis le
+  registre) et le serveur `inference` qui acceptent ou refusent la
+  connexion.
 
 ---
 
@@ -91,10 +93,10 @@ translator dédié, la persistance ne fait que **stocker et servir**.
    miroir des tables SQL.
 7. **État et diagnostic** : `/db/status` (connexion au serveur,
    version du schéma, compteurs), `/db/schema` (DDL en lecture).
-8. **Registre des clés d'accès** : émission, vérification par
-   hachage et révocation des clés nominatives du mode distant
-   d'`inference-translator`, avec journal des tentatives
-   d'authentification refusées (`auth_failures`).
+8. **Registre des clés SSH** : enregistrement des clés **publiques**
+   SSH nominatives du mode distant d'`inference-translator`,
+   empreintes SHA-256 anti-doublon, révocation, et journal des
+   tentatives d'authentification refusées (`auth_failures`).
 
 ---
 
@@ -139,31 +141,35 @@ translator dédié, la persistance ne fait que **stocker et servir**.
    (`{ "select": "run_instances", "where": { "run_id": 42 } }`)
    puis lit le résultat ligne par ligne, en JSON.
 
-### 3.2 bis Flux nominal d'une clé d'accès (mode distant d'inference)
+### 3.2 bis Flux nominal d'une clé SSH (mode distant d'inference)
 
-1. L'opérateur du cluster émet une clé nominative : il écrit une
-   ligne JSON sur `/db` :
+1. L'opérateur du cluster enregistre la clé **publique** SSH d'un
+   utilisateur : il écrit une ligne JSON sur `/db` :
    `{ "table": "access_keys", "row": { "user": "claire",
-   "key": "<clé en clair>", "label": "portable" } }`.
-2. Le translator hache la clé (SHA-256), n'écrit que `key_hash`,
-   et rend l'identifiant attribué : `{ "ok": true, "id": 7 }`.
-   La clé en clair n'est jamais persistée ni journalisée.
-3. À chaque poignée de main, le serveur `inference` soumet le
-   haché : `{ "verify": "access_keys", "key_hash": "…" }` et lit
-   la réponse : `{ "status": "valid", "user": "claire" }`,
-   `{ "status": "revoked" }` ou `{ "status": "unknown" }`.
-4. Un refus est journalisé par le serveur `inference` :
-   `{ "table": "auth_failures", "row": { "key_hash": "…",
+   "key_pub": "ssh-ed25519 AAAA…", "label": "portable" } }`.
+2. Le translator calcule l'empreinte SHA-256 de la clé publique,
+   l'écrit avec `key_pub` (l'unicité porte sur `fingerprint`) et
+   rend l'identifiant attribué : `{ "ok": true, "id": 7 }`.
+   Une clé publique n'est pas un secret : elle est stockée en clair.
+3. Le serveur `inference` lit le registre actif
+   (`{ "select": "access_keys", "where": { "revoked": false } }`)
+   et **génère `authorized_keys` depuis ce registre** — seule
+   source de vérité des accès distants ; sshd authentifie
+   l'utilisateur à la connexion SSH.
+4. Chaque échec d'authentification SSH est journalisé par le
+   serveur `inference` :
+   `{ "table": "auth_failures", "row": { "fingerprint": "…",
    "origin": "10.0.0.4" } }`.
 5. Révoquer, c'est écrire une date : `{ "revoke": "access_keys",
-   "id": 7 }` positionne `revoked_at` — jamais une
-   suppression : l'audit reste possible.
+   "id": 7 }` positionne `revoked_at` — puis re-générer
+   `authorized_keys` ; jamais une suppression : l'audit reste
+   possible.
 
 ### 3.3 Contrats d'interface (principe clé)
 
 Le contrat `orchestrator → database` est gelé en phase 0 côté
 orchestrateur ; le contrat `inference → database` (registre de
-clés) est gelé en phase 0 côté `inference-translator`. Ce dépôt
+clés SSH) est gelé en phase 0 côté `inference-translator`. Ce dépôt
 les implémente tels quels. Chaque interaction passe par le système
 de fichiers, jamais par des sockets côté appelant, ni d'API
 propriétaire :
@@ -174,7 +180,7 @@ propriétaire :
 | `/db → appelant` (lecture) | `read` du résultat : lignes JSON (une par enregistrement) ou statut (`{ "ok": … }`, `{ "duplicate": … }`). |
 | `appelant → /db` (navigation) | `read` direct de `/db/runs/<id>`, `/db/training_data/<id>`, `/db/incidents`, `/db/users`, `/db/access_keys`, … sans requête préalable. |
 | `montage` | `settrans` de `/db` avec la chaîne `conninfo` libpq en argument ; nœuds gelés : `/db/status`, `/db/schema`, `/db/training_data`, `/db/runs`, `/db/run_instances`, `/db/incidents`, `/db/users`, `/db/access_keys`, `/db/auth_failures`. |
-| `inference → /db` (clés) | `write` d'une émission (`user` + clé en clair, hachée avant stockage), d'une révocation ou d'un refus d'authentification ; `write` d'une vérification puis `read` du statut (`valid` / `revoked` / `unknown`). |
+| `inference → /db` (clés) | `write` de l'enregistrement d'une clé publique SSH (`user` + `key_pub`), d'une révocation ou d'un échec d'authentification SSH ; `read` du registre actif pour générer `authorized_keys`. |
 
 ---
 
@@ -225,16 +231,17 @@ translator ne fait que la vérifier (longueur, hexadécimal) et la
 confier à la contrainte `UNIQUE`. Le translator reste sans
 connaissance des contenus.
 
-### Clés d'accès : hachées, jamais stockées en clair
+### Clés SSH : publiques par nature, privées jamais vues
 
-La clé en clair ne traverse `/db` qu'une fois, à l'émission : le
-translator calcule son SHA-256 et n'écrit que `key_hash`. La
-vérification à la poignée de main compare les hachés ; la révocation
-est une date (`revoked_at`), pas une suppression — l'audit reste
-possible. La clé en clair n'apparaît ni dans la base, ni dans les
-journaux, ni dans aucune réponse de lecture. Le translator ne décide
-pas de l'autorisation : il rend un statut, le serveur `inference`
-accepte ou refuse.
+Le registre ne stocke que des **clés publiques** SSH — ce ne sont
+pas des secrets : elles vivent en clair, avec une empreinte SHA-256
+(`fingerprint`) qui porte l'unicité et le journal des échecs. La
+partie privée ne quitte jamais la machine de l'utilisateur et ne
+traverse jamais `/db`. La révocation est une date (`revoked_at`),
+pas une suppression — l'audit reste possible. Le translator ne
+décide pas de l'autorisation : il sert le registre ; sshd
+authentifie via `authorized_keys` généré depuis ce registre, le
+serveur `inference` décide du reste.
 
 ### Une connexion, des requêtes préparées
 
@@ -251,8 +258,8 @@ Chaque phase a un livrable, des critères d'acceptation et une
 dépendance explicite sur la précédente. Le schéma SQL (section 6)
 est **gelé côté orchestrateur en phase 0** pour les tables
 d'orchestration, et **gelé côté inference-translator en phase 0**
-pour le registre de clés ; ce dépôt les implémente tels quels et ne
-les modifie pas sans revue conjointe.
+pour le registre de clés SSH ; ce dépôt les implémente tels quels
+et ne les modifie pas sans revue conjointe.
 
 ### Phase 0 — Spécification et contrats (avant tout code)
 
@@ -261,10 +268,11 @@ les modifie pas sans revue conjointe.
   format d'échange : lignes JSON simples, une instruction par
   ligne, une réponse par ligne.
 - Reprise du contrat `inference → database` (registre des clés
-  d'accès du mode distant) proposé par `inference-translator`
+  SSH du mode distant) proposé par `inference-translator`
   (sa phase 0) : tables `users`, `access_keys`,
-  `auth_failures` (section 6), opérations d'émission, de
-  vérification, de révocation et de journalisation des refus.
+  `auth_failures` (section 6), opérations d'enregistrement de clé
+  publique, de synchronisation `authorized_keys`, de révocation et
+  de journalisation des échecs SSH.
 - Gel de l'arborescence `/db` : `status`, `schema`,
   `training_data`, `runs`, `run_instances`, `incidents`,
   `users`, `access_keys`, `auth_failures`, puis
@@ -279,9 +287,10 @@ les modifie pas sans revue conjointe.
   `orchestrator-translator` — notamment que le périmètre minimal
   requis par sa phase 1 (création du schéma + écriture de `runs` et
   `run_instances`) est couvert sans réserve — et revue croisée du
-  registre de clés avec `inference-translator` — le périmètre requis
-  par sa phase 5 (émission, vérification, révocation, journal des
-  refus) est couvert sans réserve.
+  registre de clés SSH avec `inference-translator` — le périmètre
+  requis par sa phase 5 (enregistrement, synchronisation
+  `authorized_keys`, révocation, journal des échecs) est couvert
+  sans réserve.
 
 ### Phase 1 — MVP : schéma + écritures
 
@@ -341,29 +350,30 @@ les modifie pas sans revue conjointe.
 - **Acceptation** : rejouer une tâche de la phase 3 orchestrateur à
   partir des seules données lues via `/db`.
 
-### Phase 5 — Registre des clés d'accès (mode distant d'inference-translator)
+### Phase 5 — Registre des clés SSH (mode distant d'inference-translator)
 
-- Écriture de `users` et `access_keys` : émission d'une clé
-  nominative — la clé en clair est hachée par le translator avant
-  stockage, seule l'empreinte est persistée.
-- Requête de vérification : soumission d'un haché, réponse ligne
-  JSON `{ "status": "valid" | "revoked" | "unknown", "user": … }` —
-  c'est le statut lu par le serveur `inference` à chaque poignée
-  de main de sa phase 5.
-- Révocation par simple écriture d'une date (`revoked_at`) :
-  révoquer un utilisateur ne touche ni ses autres clés, ni les
-  autres utilisateurs ; l'audit reste complet.
-- Journal des échecs d'authentification : chaque `hello` refusé
-  du serveur `inference` devient une ligne `auth_failures`
-  (haché soumis, origine, horodatage).
+- Écriture de `users` et `access_keys` : enregistrement d'une clé
+  **publique** SSH nominative, empreinte SHA-256 calculée par le
+  translator, unicité sur `fingerprint`.
+- Lecture du registre actif par le serveur `inference` pour
+  **générer `authorized_keys`** — le registre est la seule source
+  de vérité des accès distants.
+- Révocation par simple écriture d'une date (`revoked_at`) puis
+  re-génération de `authorized_keys` : révoquer un utilisateur ne
+  touche ni ses autres clés, ni les autres utilisateurs ; l'audit
+  reste complet.
+- Journal des échecs d'authentification SSH : chaque connexion
+  refusée devient une ligne `auth_failures` (empreinte soumise,
+  origine, horodatage).
 - Navigation : `/db/users`, `/db/access_keys` lisibles
   directement.
 - **Livrable** : registre de clés complet, servi uniquement via
   `/db`.
-- **Acceptation** : le démon `inference-serveur` (phase 5
-  d'`inference-translator`) accepte une clé valide, refuse une clé
-  révoquée et une clé inconnue, chaque refus est journalisé, et la
-  clé en clair n'apparaît nulle part dans la base.
+- **Acceptation** : une session SSH authentifiée par une clé du
+  registre accède au serveur `inference` (phase 5
+  d'`inference-translator`) ; une clé révoquée ou inconnue est
+  refusée, chaque refus est journalisé, et aucune clé privée
+  n'apparaît dans la base.
 
 ### Phase 6 — Durcissement, tests, CI
 
@@ -372,8 +382,8 @@ les modifie pas sans revue conjointe.
   filtres), journalisation des échecs transport.
 - Suite de tests déterministes : schéma embarqué sur instance
   PostgreSQL jetable (conteneur ou VM), tests de doublons, de
-  pagination, de reconnexion, d'émission/vérification/révocation
-  de clés, tests de charge (des dizaines de milliers de lignes).
+  pagination, de reconnexion, d'enregistrement/révocation de clés
+  SSH, tests de charge (des dizaines de milliers de lignes).
 - CI sous QEMU GNU/Hurd, pilotée par le sandbox
   [gnu-ai/mistral-vm-debian-hurd](https://github.com/gnu-ai/mistral-vm-debian-hurd).
 - Documentation utilisateur et architecture (`docs/architecture.md`).
@@ -386,7 +396,7 @@ les modifie pas sans revue conjointe.
 Ce schéma est la source de vérité partagée avec
 `orchestrator-translator` (sa section 6) pour les tables
 d'orchestration, et avec `inference-translator` (sa section 3.5)
-pour le registre de clés. Toute évolution est décidée en revue
+pour le registre de clés SSH. Toute évolution est décidée en revue
 conjointe, jamais unilatéralement.
 
 ```sql
@@ -437,21 +447,23 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Clés d'accès nominatives : seul le SHA-256 de la clé est stocké,
--- jamais la clé elle-même
+-- Clés publiques SSH nominatives (inference-translator) : une clé
+-- publique n'est pas un secret, elle vit en clair ; l'empreinte
+-- SHA-256 porte l'unicité
 CREATE TABLE IF NOT EXISTS access_keys (
     id          BIGSERIAL PRIMARY KEY,
     user_id     BIGINT NOT NULL REFERENCES users(id),
-    key_hash    CHAR(64) NOT NULL UNIQUE,     -- SHA-256 de la clé
+    key_pub     TEXT NOT NULL,                -- clé publique SSH
+    fingerprint CHAR(64) NOT NULL UNIQUE,     -- SHA-256 de la clé
     label       TEXT,                         -- ex. "portable de Claire"
     issued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at  TIMESTAMPTZ                   -- NULL = clé active
 );
 
--- Journal des tentatives d'authentification refusées (inference)
+-- Journal des tentatives d'authentification SSH refusées (inference)
 CREATE TABLE IF NOT EXISTS auth_failures (
     id          BIGSERIAL PRIMARY KEY,
-    key_hash    CHAR(64),                      -- NULL si clé malformée
+    fingerprint CHAR(64),                      -- NULL si clé invalide
     origin      TEXT,                         -- adresse d'origine
     refused_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -474,10 +486,9 @@ CREATE TABLE IF NOT EXISTS auth_failures (
 - **Contraintes SQL ≠ erreurs POSIX** : doublon, absence de ligne,
   champ manquant sont des statuts lisibles (`duplicate`, `empty`,
   `invalid`), seuls les échecs de transport remontent en `EIO`.
-- **Clés en clair jamais persistées** : la clé traverse le
-  translator une seule fois, à l'émission, pour n'y laisser que
-  son SHA-256 ; elle n'apparaît dans aucune lecture, aucun journal,
-  aucune sauvegarde documentée.
+- **Clés privées jamais vues** : le registre ne stocke que des clés
+  publiques SSH (en clair — nature publique) et leurs empreintes
+  SHA-256 ; une clé privée ne traverse jamais `/db`.
 - Chaque translator reste remplaçable : l'orchestrateur ne connaît
   que `/db` et le contrat d'échange, jamais ce binaire.
 
@@ -492,7 +503,7 @@ CREATE TABLE IF NOT EXISTS auth_failures (
 | 2 | `incidents` + requêtes de lecture | 1 | orchestrateur phase 2 |
 | 3 | Gros contenus, anti-doublon avant téléchargement | 1 | orchestrateur phase 3 |
 | 4 | Rejouabilité, exports, historique SQL | 2, 3 | orchestrateur phase 4 |
-| 5 | Registre de clés : `users`, `access_keys`, `auth_failures` | 1 | inference phase 5 |
+| 5 | Registre de clés SSH : `users`, `access_keys`, `auth_failures` | 1 | inference phase 5 |
 | 6 | Durcissement, CI Hurd, v1.0 | 1–5 | orchestrateur phase 6, inference phase 7 |
 
 Les jalons 1→2 et 1→3 peuvent avancer en parallèle, comme les fils
@@ -500,6 +511,6 @@ de travail de l'orchestrateur. La base de données n'est pas un
 chantier en soi : c'est une propriété permanente de la pile — ce
 dépôt ne fait qu'implémenter fidèlement les contrats et le schéma
 gelés ensemble, puis les servir vite, sans fuite, et sans jamais
-décider à la place de l'appelant. Le registre de clés suit la même
-règle : le translator rend des statuts, le serveur `inference`
-décide.
+décider à la place de l'appelant. Le registre de clés SSH suit la
+même règle : le translator sert le registre, sshd authentifie, le
+serveur `inference` décide.
