@@ -16,9 +16,10 @@ expose une base PostgreSQL comme un système de fichiers Hurd, afin
 que les autres translators — en premier lieu
 [orchestrator-translator](https://github.com/gnu-ai/orchestrator-translator)
 — écrivent et relisent leurs données (données d'entraînement,
-exécutions, résultats, incidents) par de simples `write`/`read`
-POSIX, sans jamais lier une bibliothèque cliente SQL ni ouvrir de
-socket vers le serveur.
+exécutions, résultats, incidents, clés d'accès du mode distant
+d'[inference-translator](https://github.com/gnu-ai/inference-translator))
+par de simples `write`/`read` POSIX, sans jamais lier une
+bibliothèque cliente SQL ni ouvrir de socket vers le serveur.
 
 Licence : GPLv3 ou version ultérieure. Langage : C23, POSIX.1-2008,
 interfaces Hurd (`trivfs`), client PostgreSQL via `libpq`.
@@ -34,9 +35,9 @@ translator dédié, la persistance ne fait que **stocker et servir**.
 |---|---|---|
 | `orchestrator-translator` | coordination : scheduler, supervisor, evaluator, aggregator ; écrit et lit via `/db` | gnu-ai/orchestrator-translator |
 | `neuron-translator` | unité de calcul : réseau sigmoïde feedforward, piloté par POSIX | gnu-ai/neuron-translator |
-| `inference-translator` | interface de dialogue : reçoit les prompts, extrait les requêtes et URL | gnu-ai/inference-translator |
+| `inference-translator` | interface de dialogue : prompts, requêtes structurées, mode distant authentifié par clé | gnu-ai/inference-translator |
 | `httpfs-translator` | transport pur HTTP → système de fichiers (`content`, `headers`, `status`) | gnu-ai/httpfs-translator |
-| `data-base-translator` | persistance PostgreSQL : données d'entraînement, exécutions, résultats, historique | ce dépôt |
+| `data-base-translator` | persistance PostgreSQL : données d'entraînement, exécutions, résultats, historique, clés d'accès | ce dépôt |
 
 ### Ce que ce translator garantit aux autres
 
@@ -48,6 +49,9 @@ translator dédié, la persistance ne fait que **stocker et servir**.
   BDD" ne peut se creuser dans la pile.
 - **Rejouabilité** : ce qui a été acquis sur le réseau ou calculé
   peut être relu plus tard, à l'identique, réseau coupé.
+- **Secrets jamais en clair** : les clés d'accès du mode distant
+  d'`inference-translator` ne sont stockées que hachées
+  (SHA-256) ; le translator hache, la base ne voit jamais la clé.
 
 ### Ce qu'il ne fait pas
 
@@ -57,6 +61,9 @@ translator dédié, la persistance ne fait que **stocker et servir**.
   `TEXT` opaque, y compris une page d'erreur 404.
 - Pas de décision sur les données : un doublon (`checksum`) est
   signalé à l'appelant, jamais silencieusement écrasé ni ignoré.
+- Pas de décision d'autorisation : il rend un statut de clé
+  (`valid`, `revoked`, `unknown`), c'est au serveur
+  `inference` d'accepter ou de refuser la connexion.
 
 ---
 
@@ -65,7 +72,8 @@ translator dédié, la persistance ne fait que **stocker et servir**.
 1. **Translator monté sur `/db`** : pilotable par les commandes POSIX
    (`settrans`, `write`, `read`), interrogeable avec `cat`.
 2. **Création idempotente du schéma** : au montage, les tables
-   `training_data`, `runs`, `run_instances` et `incidents` (section 6)
+   `training_data`, `runs`, `run_instances`, `incidents`,
+   `users`, `access_keys` et `auth_failures` (section 6)
    sont créées si absentes, sans jamais détruire des données
    existantes.
 3. **Écriture d'enregistrements** : une ligne JSON soumise par
@@ -78,10 +86,15 @@ translator dédié, la persistance ne fait que **stocker et servir**.
    `training_data.checksum` est exposée à l'appelant comme un statut
    lisible (`duplicate`), pas comme une erreur POSIX fatale.
 6. **Navigation par arborescence** : `/db/runs/<id>`,
-   `/db/runs/<id>/instances`, `/db/training_data/<id>` … lisibles
-   directement, en miroir des tables SQL.
+   `/db/runs/<id>/instances`, `/db/training_data/<id>`,
+   `/db/users`, `/db/access_keys` … lisibles directement, en
+   miroir des tables SQL.
 7. **État et diagnostic** : `/db/status` (connexion au serveur,
    version du schéma, compteurs), `/db/schema` (DDL en lecture).
+8. **Registre des clés d'accès** : émission, vérification par
+   hachage et révocation des clés nominatives du mode distant
+   d'`inference-translator`, avec journal des tentatives
+   d'authentification refusées (`auth_failures`).
 
 ---
 
@@ -94,10 +107,10 @@ translator dédié, la persistance ne fait que **stocker et servir**.
         │       orchestrator-translator        │
         │  scheduler / supervisor /           │
         │  evaluator / aggregator             │
-        └───┬──────────────────────────────▲───┘
+        └───┬────────────────────────────▲───┘
             │ write (enregistrements,      │ read (requêtes,
             │      requêtes)               │      résultats)
-            ▼                              │
+            ▼                             │
         ┌───────────────────────┐
         │  data-base-translator │  /db : POSIX ↔ SQL
         │  trivfs / netfs       │
@@ -126,19 +139,42 @@ translator dédié, la persistance ne fait que **stocker et servir**.
    (`{ "select": "run_instances", "where": { "run_id": 42 } }`)
    puis lit le résultat ligne par ligne, en JSON.
 
+### 3.2 bis Flux nominal d'une clé d'accès (mode distant d'inference)
+
+1. L'opérateur du cluster émet une clé nominative : il écrit une
+   ligne JSON sur `/db` :
+   `{ "table": "access_keys", "row": { "user": "claire",
+   "key": "<clé en clair>", "label": "portable" } }`.
+2. Le translator hache la clé (SHA-256), n'écrit que `key_hash`,
+   et rend l'identifiant attribué : `{ "ok": true, "id": 7 }`.
+   La clé en clair n'est jamais persistée ni journalisée.
+3. À chaque poignée de main, le serveur `inference` soumet le
+   haché : `{ "verify": "access_keys", "key_hash": "…" }` et lit
+   la réponse : `{ "status": "valid", "user": "claire" }`,
+   `{ "status": "revoked" }` ou `{ "status": "unknown" }`.
+4. Un refus est journalisé par le serveur `inference` :
+   `{ "table": "auth_failures", "row": { "key_hash": "…",
+   "origin": "10.0.0.4" } }`.
+5. Révoquer, c'est écrire une date : `{ "revoke": "access_keys",
+   "id": 7 }` positionne `revoked_at` — jamais une
+   suppression : l'audit reste possible.
+
 ### 3.3 Contrats d'interface (principe clé)
 
 Le contrat `orchestrator → database` est gelé en phase 0 côté
-orchestrateur ; ce dépôt l'implémente tel quel. Chaque interaction
-passe par le système de fichiers, jamais par des sockets côté
-appelant, ni d'API propriétaire :
+orchestrateur ; le contrat `inference → database` (registre de
+clés) est gelé en phase 0 côté `inference-translator`. Ce dépôt
+les implémente tels quels. Chaque interaction passe par le système
+de fichiers, jamais par des sockets côté appelant, ni d'API
+propriétaire :
 
 | Contract | Échange |
 |---|---|
 | `appelant → /db` (écriture) | `write` d'une ligne JSON : insertion (`table` + `row`) ou requête (`select` + filtres). |
 | `/db → appelant` (lecture) | `read` du résultat : lignes JSON (une par enregistrement) ou statut (`{ "ok": … }`, `{ "duplicate": … }`). |
-| `appelant → /db` (navigation) | `read` direct de `/db/runs/<id>`, `/db/training_data/<id>`, `/db/incidents`, … sans requête préalable. |
-| `montage` | `settrans` de `/db` avec la chaîne `conninfo` libpq en argument ; nœuds gelés : `/db/status`, `/db/schema`, `/db/training_data`, `/db/runs`, `/db/run_instances`, `/db/incidents`. |
+| `appelant → /db` (navigation) | `read` direct de `/db/runs/<id>`, `/db/training_data/<id>`, `/db/incidents`, `/db/users`, `/db/access_keys`, … sans requête préalable. |
+| `montage` | `settrans` de `/db` avec la chaîne `conninfo` libpq en argument ; nœuds gelés : `/db/status`, `/db/schema`, `/db/training_data`, `/db/runs`, `/db/run_instances`, `/db/incidents`, `/db/users`, `/db/access_keys`, `/db/auth_failures`. |
+| `inference → /db` (clés) | `write` d'une émission (`user` + clé en clair, hachée avant stockage), d'une révocation ou d'un refus d'authentification ; `write` d'une vérification puis `read` du statut (`valid` / `revoked` / `unknown`). |
 
 ---
 
@@ -189,6 +225,17 @@ translator ne fait que la vérifier (longueur, hexadécimal) et la
 confier à la contrainte `UNIQUE`. Le translator reste sans
 connaissance des contenus.
 
+### Clés d'accès : hachées, jamais stockées en clair
+
+La clé en clair ne traverse `/db` qu'une fois, à l'émission : le
+translator calcule son SHA-256 et n'écrit que `key_hash`. La
+vérification à la poignée de main compare les hachés ; la révocation
+est une date (`revoked_at`), pas une suppression — l'audit reste
+possible. La clé en clair n'apparaît ni dans la base, ni dans les
+journaux, ni dans aucune réponse de lecture. Le translator ne décide
+pas de l'autorisation : il rend un statut, le serveur `inference`
+accepte ou refuse.
+
 ### Une connexion, des requêtes préparées
 
 Le MVP maintient **une seule connexion libpq** avec un jeu fixe de
@@ -202,8 +249,10 @@ translators concurrents l'exigent — mesuré avant d'être construit.
 
 Chaque phase a un livrable, des critères d'acceptation et une
 dépendance explicite sur la précédente. Le schéma SQL (section 6)
-est **gelé côté orchestrateur en phase 0** ; ce dépôt l'implémente
-tel quel et ne le modifie pas sans revue conjointe.
+est **gelé côté orchestrateur en phase 0** pour les tables
+d'orchestration, et **gelé côté inference-translator en phase 0**
+pour le registre de clés ; ce dépôt les implémente tels quels et ne
+les modifie pas sans revue conjointe.
 
 ### Phase 0 — Spécification et contrats (avant tout code)
 
@@ -211,18 +260,28 @@ tel quel et ne le modifie pas sans revue conjointe.
   `orchestrator-translator` (section 3.3) ; du même coup, gel du
   format d'échange : lignes JSON simples, une instruction par
   ligne, une réponse par ligne.
+- Reprise du contrat `inference → database` (registre des clés
+  d'accès du mode distant) proposé par `inference-translator`
+  (sa phase 0) : tables `users`, `access_keys`,
+  `auth_failures` (section 6), opérations d'émission, de
+  vérification, de révocation et de journalisation des refus.
 - Gel de l'arborescence `/db` : `status`, `schema`,
-  `training_data`, `runs`, `run_instances`, `incidents`, puis
+  `training_data`, `runs`, `run_instances`, `incidents`,
+  `users`, `access_keys`, `auth_failures`, puis
   navigation par identifiant.
 - Implémentation de référence du schéma SQL de la section 6 (fichier
-  `schema.sql`, source de vérité partagé avec l'orchestrateur).
+  `schema.sql`, source de vérité partagée avec l'orchestrateur et
+  l'interface).
 - Convention d'arguments de montage : `conninfo` libpq, options de
   migration (`create`, `verify`, `readonly`).
 - **Livrable** : `SPEC.md` + squelette de code compilable.
 - **Acceptation** : revue croisée du contrat avec
   `orchestrator-translator` — notamment que le périmètre minimal
   requis par sa phase 1 (création du schéma + écriture de `runs` et
-  `run_instances`) est couvert sans réserve.
+  `run_instances`) est couvert sans réserve — et revue croisée du
+  registre de clés avec `inference-translator` — le périmètre requis
+  par sa phase 5 (émission, vérification, révocation, journal des
+  refus) est couvert sans réserve.
 
 ### Phase 1 — MVP : schéma + écritures
 
@@ -234,7 +293,7 @@ tel quel et ne le modifie pas sans revue conjointe.
 - **Livrable** : `data-base-translator` compilable sous Hurd, monté
   sur `/db`, capable d'enregistrer une exécution complète de
   l'orchestrateur.
-- **Acceptation** : la phase 1 de `orchestrator-translator`
+- **Acceptation** : la phase 1 d'`orchestrator-translator`
   (exécution avec 2 et 8 instances de `neuron-translator`) persiste
   ses `runs`/`run_instances` via ce translator, et les lignes sont
   visibles côté SQL ; `make check` vert.
@@ -282,15 +341,39 @@ tel quel et ne le modifie pas sans revue conjointe.
 - **Acceptation** : rejouer une tâche de la phase 3 orchestrateur à
   partir des seules données lues via `/db`.
 
-### Phase 5 — Durcissement, tests, CI
+### Phase 5 — Registre des clés d'accès (mode distant d'inference-translator)
+
+- Écriture de `users` et `access_keys` : émission d'une clé
+  nominative — la clé en clair est hachée par le translator avant
+  stockage, seule l'empreinte est persistée.
+- Requête de vérification : soumission d'un haché, réponse ligne
+  JSON `{ "status": "valid" | "revoked" | "unknown", "user": … }` —
+  c'est le statut lu par le serveur `inference` à chaque poignée
+  de main de sa phase 5.
+- Révocation par simple écriture d'une date (`revoked_at`) :
+  révoquer un utilisateur ne touche ni ses autres clés, ni les
+  autres utilisateurs ; l'audit reste complet.
+- Journal des échecs d'authentification : chaque `hello` refusé
+  du serveur `inference` devient une ligne `auth_failures`
+  (haché soumis, origine, horodatage).
+- Navigation : `/db/users`, `/db/access_keys` lisibles
+  directement.
+- **Livrable** : registre de clés complet, servi uniquement via
+  `/db`.
+- **Acceptation** : le démon `inference-serveur` (phase 5
+  d'`inference-translator`) accepte une clé valide, refuse une clé
+  révoquée et une clé inconnue, chaque refus est journalisé, et la
+  clé en clair n'apparaît nulle part dans la base.
+
+### Phase 6 — Durcissement, tests, CI
 
 - Reconnexion automatique au serveur PostgreSQL, comportement en
   lecture seule documenté, requêtes bornées (limites imposées aux
   filtres), journalisation des échecs transport.
 - Suite de tests déterministes : schéma embarqué sur instance
   PostgreSQL jetable (conteneur ou VM), tests de doublons, de
-  pagination, de reconnexion, tests de charge (des dizaines de
-  milliers de lignes).
+  pagination, de reconnexion, d'émission/vérification/révocation
+  de clés, tests de charge (des dizaines de milliers de lignes).
 - CI sous QEMU GNU/Hurd, pilotée par le sandbox
   [gnu-ai/mistral-vm-debian-hurd](https://github.com/gnu-ai/mistral-vm-debian-hurd).
 - Documentation utilisateur et architecture (`docs/architecture.md`).
@@ -298,11 +381,13 @@ tel quel et ne le modifie pas sans revue conjointe.
 
 ---
 
-## 6. Schéma PostgreSQL (gelé côté orchestrateur, implémenté ici)
+## 6. Schéma PostgreSQL (gelé côté orchestrateur et inference, implémenté ici)
 
 Ce schéma est la source de vérité partagée avec
-`orchestrator-translator` (sa section 6). Toute évolution est
-décidée en revue conjointe, jamais unilatéralement.
+`orchestrator-translator` (sa section 6) pour les tables
+d'orchestration, et avec `inference-translator` (sa section 3.5)
+pour le registre de clés. Toute évolution est décidée en revue
+conjointe, jamais unilatéralement.
 
 ```sql
 -- Données d'entraînement récupérées sur le net
@@ -344,6 +429,32 @@ CREATE TABLE IF NOT EXISTS incidents (
     kind        TEXT NOT NULL,                -- crash | timeout | restart
     detected_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Utilisateurs autorisés au mode distant (inference-translator)
+CREATE TABLE IF NOT EXISTS users (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Clés d'accès nominatives : seul le SHA-256 de la clé est stocké,
+-- jamais la clé elle-même
+CREATE TABLE IF NOT EXISTS access_keys (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     BIGINT NOT NULL REFERENCES users(id),
+    key_hash    CHAR(64) NOT NULL UNIQUE,     -- SHA-256 de la clé
+    label       TEXT,                         -- ex. "portable de Claire"
+    issued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at  TIMESTAMPTZ                   -- NULL = clé active
+);
+
+-- Journal des tentatives d'authentification refusées (inference)
+CREATE TABLE IF NOT EXISTS auth_failures (
+    id          BIGSERIAL PRIMARY KEY,
+    key_hash    CHAR(64),                      -- NULL si clé malformée
+    origin      TEXT,                         -- adresse d'origine
+    refused_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 ---
@@ -363,6 +474,10 @@ CREATE TABLE IF NOT EXISTS incidents (
 - **Contraintes SQL ≠ erreurs POSIX** : doublon, absence de ligne,
   champ manquant sont des statuts lisibles (`duplicate`, `empty`,
   `invalid`), seuls les échecs de transport remontent en `EIO`.
+- **Clés en clair jamais persistées** : la clé traverse le
+  translator une seule fois, à l'émission, pour n'y laisser que
+  son SHA-256 ; elle n'apparaît dans aucune lecture, aucun journal,
+  aucune sauvegarde documentée.
 - Chaque translator reste remplaçable : l'orchestrateur ne connaît
   que `/db` et le contrat d'échange, jamais ce binaire.
 
@@ -370,18 +485,21 @@ CREATE TABLE IF NOT EXISTS incidents (
 
 ## 8. Jalons synthétiques
 
-| Phase | Contenu | Dépend de | Attendu par (orchestrateur) |
+| Phase | Contenu | Dépend de | Attendu par (pile) |
 |---|---|---|---|
-| 0 | Spécification, contrats, `schema.sql` | — | phase 0 (revue conjointe) |
-| 1 | MVP : schéma + écritures `runs`/`run_instances`/`training_data` | 0 | phase 1 |
-| 2 | `incidents` + requêtes de lecture | 1 | phase 2 |
-| 3 | Gros contenus, anti-doublon avant téléchargement | 1 | phase 3 |
-| 4 | Rejouabilité, exports, historique SQL | 2, 3 | phase 4 |
-| 5 | Durcissement, CI Hurd, v1.0 | 1–4 | phase 6 |
+| 0 | Spécification, contrats, `schema.sql` | — | orchestrateur phase 0, inference phase 0 |
+| 1 | MVP : schéma + écritures `runs`/`run_instances`/`training_data` | 0 | orchestrateur phase 1 |
+| 2 | `incidents` + requêtes de lecture | 1 | orchestrateur phase 2 |
+| 3 | Gros contenus, anti-doublon avant téléchargement | 1 | orchestrateur phase 3 |
+| 4 | Rejouabilité, exports, historique SQL | 2, 3 | orchestrateur phase 4 |
+| 5 | Registre de clés : `users`, `access_keys`, `auth_failures` | 1 | inference phase 5 |
+| 6 | Durcissement, CI Hurd, v1.0 | 1–5 | orchestrateur phase 6, inference phase 7 |
 
 Les jalons 1→2 et 1→3 peuvent avancer en parallèle, comme les fils
 de travail de l'orchestrateur. La base de données n'est pas un
 chantier en soi : c'est une propriété permanente de la pile — ce
-dépôt ne fait qu'implémenter fidèlement le contrat et le schéma
+dépôt ne fait qu'implémenter fidèlement les contrats et le schéma
 gelés ensemble, puis les servir vite, sans fuite, et sans jamais
-décider à la place de l'appelant.
+décider à la place de l'appelant. Le registre de clés suit la même
+règle : le translator rend des statuts, le serveur `inference`
+décide.
