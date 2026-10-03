@@ -39,17 +39,34 @@ AC_SUBST([C23_CFLAGS], [$dbt_cv_c23])
 
 AC_CONFIG_HEADERS([config.h])
 
+# --- GNU/Hurd ou non ---------------------------------------------------
+# Le cœur du contrat (contract.c, ops.c, storage.c) est du C23/POSIX
+# pur et se compile partout ; seules la boucle serveur trivfs et
+# l'édition de liens des bibliothèques Hurd sont propres à
+# GNU/Hurd.  Le système hôte décide quelle face est liée :
+#   - gnu*/mach*  : main-hurd.c + trivfs-hooks.c (translator /db) ;
+#   - sinon       : main.c (binaire de vérification sur stdio —
+#                   utile pour `make check` et la compilation
+#                   continue sur les autres POSIX).
+case "$host_os" in
+  gnu*|mach*) hurd_system=yes ;;
+  *)          hurd_system=no ;;
+esac
+AM_CONDITIONAL([ON_HURD], [test "x$hurd_system" = xyes])
+
 # libpq est le contrat de ce translator (PLAN.md section 3) : le
-# squelette de phase 0 ne le lie pas encore, mais configure en
-# rapporte la présence, si bien que la phase 1 branchera les
-# drapeaux sans retoucher ce fichier.  À l'image de libmicrohttpd
-# dans httpfs-translator, l'absence est un avertissement, pas une
-# erreur : la pile reste compilable partout.
+# driver est lié quand il est présent, et HAVE_LIBPQ l'annonce au
+# code.  À l'image de libmicrohttpd dans httpfs-translator,
+# l'absence est un avertissement, pas une erreur : sans driver le
+# binaire reste compilable et testable (statut lisible, écritures
+# en échec de transport), et la pile reste compilable partout.
 PKG_CHECK_MODULES([LIBPQ], [libpq >= 12.0],
                   [have_libpq=yes], [have_libpq=no])
 AM_CONDITIONAL([HAVE_LIBPQ], [test "x$have_libpq" = xyes])
-AS_IF([test "x$have_libpq" = xno],
-      [AC_MSG_WARN([libpq not found: fine for the phase 0 skeleton, required from phase 1])])
+AS_IF([test "x$have_libpq" = xyes],
+      [AC_DEFINE([HAVE_LIBPQ], [1],
+                 [Define to 1 when the libpq driver is linked in.])],
+      [AC_MSG_WARN([libpq not found: the status stays readable, every write fails as EIO])])
 
 AC_CONFIG_FILES([
     Makefile

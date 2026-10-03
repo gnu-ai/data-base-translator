@@ -85,3 +85,6 @@ src/db-translator
 
 # Automake dir stamps
 .dirstamp
+
+# Out-of-tree build directory
+/build/

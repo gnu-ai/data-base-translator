@@ -1,25 +1,52 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Claire Ivanenka <claire@gnu-ai.org>
 
-bin_PROGRAMS = db-translator
+# --- Le cœur du contrat ------------------------------------------------
+# contract.c (parseur JSON de la ligne, réponses), storage.c (états,
+# compteurs, DDL embarqué) et ops.c (moteur une ligne -> une
+# réponse) sont du C23/POSIX pur.  Le driver libpq (storage_pg.c)
+# n'est lié que quand configure l'a trouvé — sans lui le binaire
+# reste compilable, le statut reste lisible et honnête.  La
+# bibliothèque est aussi ce que lie la suite de tests.
+noinst_LIBRARIES = libdbtcore.a
 
-# --- Phase 0: the compilable skeleton --------------------------------
-#
-# The translator /db (idempotent schema, JSON lines in, streamed
-# lines out — PLAN.md section 3) arrives with phase 1 built on
-# trivfs and libpq.  The skeleton answers the GNU base commands so
-# that the binary is inspectable on any POSIX system, Hurd or not.
+libdbtcore_a_SOURCES = \
+    contract.c \
+    storage.c \
+    ops.c
 
-db_translator_SOURCES = main.c
+# The internal headers are part of the core library: listing them
+# here puts them in the distribution so the VPATH builds of
+# `make distcheck` compile from the released tarball.
+noinst_HEADERS = \
+    contract.h \
+    ops.h \
+    storage.h \
+    storage_pg.h
 
-AM_CPPFLAGS = -I$(top_srcdir)
+if HAVE_LIBPQ
+libdbtcore_a_SOURCES += storage_pg.c
+libdbtcore_a_CPPFLAGS = $(AM_CPPFLAGS) $(LIBPQ_CFLAGS)
+endif
+
+AM_CPPFLAGS = -I$(top_srcdir)/src
 AM_CFLAGS = $(C23_CFLAGS) -Wall -Wextra
 
-# libpq is detected by configure; the phase 0 skeleton does not
-# link it, the flags are wired so phase 1 only adds its sources.
-if HAVE_LIBPQ
-db_translator_CPPFLAGS = $(AM_CPPFLAGS) $(LIBPQ_CFLAGS)
-db_translator_LDADD = $(LIBPQ_LIBS)
+bin_PROGRAMS = db-translator
+
+# --- La face du binaire, selon le système -------------------------------
+# Sur GNU/Hurd, main-hurd.c suit la structure canonique d'un
+# translator trivfs (trivfs_startup puis boucle serveur) et
+# trivfs-hooks.c implémente les trivfs_S_* du protocole de lignes ;
+# ailleurs, main.c construit le même moteur en mode vérification
+# sur les flux standards (même convention que neuron-translator).
+if ON_HURD
+db_translator_SOURCES = trivfs-hooks.c main-hurd.c
+db_translator_CPPFLAGS = $(AM_CPPFLAGS) -DON_HURD $(LIBPQ_CFLAGS)
+db_translator_LDADD = libdbtcore.a -ltrivfs -lfshelp -lports \
+                      -lshouldbeinlibc $(LIBPQ_LIBS)
 else
-db_translator_LDADD =
+db_translator_SOURCES = main.c
+db_translator_CPPFLAGS = $(AM_CPPFLAGS) $(LIBPQ_CFLAGS)
+db_translator_LDADD = libdbtcore.a $(LIBPQ_LIBS)
 endif

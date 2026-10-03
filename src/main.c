@@ -2,43 +2,45 @@
  * SPDX-FileCopyrightText: 2026 Claire Ivanenka <claire@gnu-ai.org> */
 
 /*
- * main.c — Entry point of the data-base-translator (phase 0
- * skeleton).
+ * main.c — Entry point of the verification build (non-Hurd POSIX).
  *
  * USAGE
  * -----
  *      db-translator --version
  *      db-translator --help
- *      settrans -a /db db-translator --conninfo "dbname=gnuai"   (phase 1)
+ *      db-translator [--conninfo STRING] < instructions.jsonl
  *
- * data-base-translator is the persistence layer of the GNU AI
- * stack: it exposes a PostgreSQL database as a Hurd filesystem, so
- * that the other translators read and write their data (training
- * data, runs, incidents, the SSH key registry of the remote mode)
- * by plain POSIX writes and reads — never by linking a SQL client
- * library or opening a socket (PLAN.md section 1).
+ * On GNU/Hurd the binary is the trivfs translator mounted by
+ * settrans (see main-hurd.c); everywhere else it is the same
+ * engine over standard streams: one instruction line in, one
+ * response line out.  This is how the contract is tested on any
+ * POSIX system without Hurd libraries and without a mounted
+ * translator — exactly the split used by neuron-translator.
  *
- * The phase 0 skeleton answers the GNU base commands and refuses
- * everything else: the /db translator itself arrives with phase 1.
- * The build architecture is the one shared by the whole stack
- * (see httpfs-translator).
+ * Transport failures are reported on stderr with the EIO they
+ * stand for, and make the exit status 1; they never stop the
+ * loop: the translator retries on the next line, it does not die
+ * (PLAN.md section 4).
  */
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "ops.h"
+#include "storage.h"
+
 /* --- The GNU base commands ----------------------------------------
    Every binary of the GNU AI stack answers --version and --help
-   before anything else, so a translator stays inspectable like any
-   other GNU tool — from a shell or from a script.  The answers
-   follow the GNU coding standards; the version number comes from
-   configure (config.h), the single source of truth of the release. */
+   before anything else, so a translator stays inspectable like
+   any other GNU tool.  The answers follow the GNU coding
+   standards; the version number comes from configure. */
 
 static void
 print_version (void)
@@ -55,26 +57,29 @@ static void
 print_help (void)
 {
     printf ("Usage: db-translator [OPTION]... [--conninfo STRING]\n");
-    printf ("Persistence layer of the GNU AI stack for GNU/Hurd.\n");
+    printf ("Persistence layer of the GNU AI stack.\n");
     printf ("\n");
-    printf ("  -h, --help     display this help and exit\n");
-    printf ("  -V, --version  output version information and exit\n");
+    printf ("  -h, --help          display this help and exit\n");
+    printf ("  -V, --version       output version information and exit\n");
+    printf ("      --conninfo STR  libpq connection string"
+            " (default: dbname=gnuai)\n");
     printf ("\n");
-    printf ("Phase 1 mounts the translator:\n");
+    printf ("On GNU/Hurd, the binary is the /db translator:\n");
     printf ("  settrans -a /db db-translator --conninfo \"dbname=gnuai\"\n");
-    printf ("Then a row is plain POSIX:\n");
-    printf ("  echo '{\"table\": \"runs\", \"row\": {…}}' > /db/runs\n");
-    printf ("  cat /db/runs\n");
+    printf ("Elsewhere it reads instruction lines on stdin and\n");
+    printf ("answers one response line on stdout per instruction.\n");
     printf ("\n");
     printf ("Report bugs at"
             " <https://github.com/gnu-ai/data-base-translator/issues>.\n");
 }
 
-/* Scan the command line; return true when one of the two base
- * commands was recognized and answered (the caller exits 0),
- * false when the normal startup should proceed. */
+/* Returns true when a base command was answered (exit 0), false
+ * when the startup must proceed.  The option parsing is
+ * deliberately hand written: the translator must parse its
+ * arguments without glibc's argp, which is not available under
+ * the Hurd bootstrap conditions the sibling entry point faces. */
 static bool
-handle_gnu_options (int argc, char *argv[])
+handle_gnu_options (int argc, char *argv[], const char **conninfo)
 {
     for (int i = 1; i < argc; i++)
         {
@@ -90,6 +95,16 @@ handle_gnu_options (int argc, char *argv[])
                     print_help ();
                     return true;
                 }
+            if (strcmp (argv[i], "--conninfo") == 0)
+                {
+                    if (i + 1 >= argc)
+                        {
+                            fprintf (stderr, "db-translator:"
+                                     " --conninfo requires an argument\n");
+                            exit (EXIT_FAILURE);
+                        }
+                    *conninfo = argv[++i];
+                }
         }
     return false;
 }
@@ -97,16 +112,42 @@ handle_gnu_options (int argc, char *argv[])
 int
 main (int argc, char *argv[])
 {
-    /* The base commands are answered before any Hurd library or
-     * libpq call is made. */
-    if (handle_gnu_options (argc, argv))
+    const char *conninfo = "dbname=gnuai";
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    int transport_failures = 0;
+
+    /* The base commands are answered before any library call. */
+    if (handle_gnu_options (argc, argv, &conninfo))
         return EXIT_SUCCESS;
 
-    /* Phase 0: nothing is mounted yet.  Refuse cleanly instead of
-     * dying deep inside a library — the same exit path that
-     * settrans will report as "Translator died". */
-    fprintf (stderr, "db-translator: phase 0 skeleton —"
-             " the /db translator arrives with phase 1"
-             " (see PLAN.md)\n");
-    return EXIT_FAILURE;
+    ops_init (conninfo);
+
+    /* One instruction line in, one response line out: the same
+     * engine the trivfs hooks run, over standard streams. */
+    while ((n = getline (&line, &cap, stdin)) >= 0)
+        {
+            size_t len = (size_t) n;
+
+            if (len > 0 && line[len - 1] == '\n')
+                len--;
+            if (ops_process_line (line, len) < 0)
+                {
+                    fprintf (stderr, "db-translator: %s (EIO)\n",
+                             dbt_storage_last_error ());
+                    transport_failures++;
+                }
+            else
+                {
+                    fwrite (ops_response (), 1, ops_response_len (),
+                            stdout);
+                    fputc ('\n', stdout);
+                    fflush (stdout);
+                }
+        }
+
+    free (line);
+    ops_shutdown ();
+    return transport_failures > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
