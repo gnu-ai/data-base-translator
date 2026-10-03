@@ -250,6 +250,24 @@ requêtes préparées (une par table et par type d'opération du
 contrat). Le pool de connexions n'arrive que si plusieurs
 translators concurrents l'exigent — mesuré avant d'être construit.
 
+### Le cluster dès la phase 3 : concurrence mesurée, registre anticipé
+
+Dès la phase 3, plusieurs nœuds d'un cluster orchestrateur
+écrivent et lisent **simultanément** dans `/db`. Trois décisions :
+
+1. Le **verrou sur la connexion libpq** est le mécanisme par
+   défaut ; le pool n'arrive que si les mesures l'exigent. Le
+   cluster ne force pas le pool — il le rend **mesurable**.
+2. Les tables `users` et `access_keys` sont créées dès la phase 3
+   (au lieu de la phase 5), parce que l'authentification des
+   nœuds et des utilisateurs du cluster en a besoin dès le
+   premier nœud distant. Leur exploitation complète
+   (synchronisation `authorized_keys`, journal `auth_failures`)
+   reste en phase 5.
+3. Aucune écriture ne doit laisser d'état partiel visible, quel
+   que soit le nombre d'écrivants — c'est la **transaction SQL**
+   qui le garantit, pas la topologie du cluster.
+
 ---
 
 ## 5. Phases
@@ -330,12 +348,22 @@ et ne les modifie pas sans revue conjointe.
 - Requêtes par plage de date, par statut HTTP, par absence en base
   (`checksum` connu ?) pour permettre l'anti-doublon côté
   orchestrateur **avant** téléchargement.
+- **Mode cluster dès cette phase** : écritures et lectures
+  concurrentes de plusieurs nœuds d'un cluster — verrou sur la
+  connexion libpq partagée, pool de connexions si les mesures
+  l'exigent, une vue cohérente par lecteur. Création anticipée
+  des tables `users` et `access_keys` (section 6) dès cette
+  phase, pour l'authentification des nœuds et des utilisateurs
+  du cluster ; leur exploitation complète (synchronisation
+  `authorized_keys`, journal `auth_failures`) reste en phase 5.
 - **Livrable** : une tâche complète de la phase 3 orchestrateur
   ("prompt → URL → contenu → N réseaux → résultat") archivée et
   relue uniquement via `/db`.
 - **Acceptation** : les deux traces d'une démonstration orchestrateur
   (URL réelle + URL en 404) sont présentes dans `training_data`,
-  relues depuis `/db` sans accès réseau.
+  relues depuis `/db` sans accès réseau. La démonstration tourne
+  sur un cluster de **deux nœuds** écrivant simultanément dans
+  `/db`, sans état partiel visible.
 
 ### Phase 4 — Rejouabilité : exports et historique
 
