@@ -483,6 +483,13 @@ CREATE TABLE IF NOT EXISTS auth_failures (
   sur des paramètres, jamais interpolées.
 - **Zéro allocation dans les chemins chauds** : requêtes préparées
   au montage, zones contiguës pré-allouées, lectures paginées.
+- **Multitâche et multi-utilisateurs** : le translator doit servir
+  plusieurs appelants et plusieurs utilisateurs **simultanément** —
+  requêtes concurrentes sérialisées proprement (verrou sur la
+  connexion libpq partagée), curseur de lecture paginé propre à
+  chaque lecteur, aucun état global non protégé ; c'est cette
+  exigence qui décide, mesures à l'appui, du passage d'une
+  connexion unique au pool de connexions.
 - **Contraintes SQL ≠ erreurs POSIX** : doublon, absence de ligne,
   champ manquant sont des statuts lisibles (`duplicate`, `empty`,
   `invalid`), seuls les échecs de transport remontent en `EIO`.
