@@ -492,6 +492,27 @@ CREATE TABLE IF NOT EXISTS auth_failures (
 - Chaque translator reste remplaçable : l'orchestrateur ne connaît
   que `/db` et le contrat d'échange, jamais ce binaire.
 
+### Stratégie de tests unitaires
+
+- **Harnais maison minimal** : macros `CHECK` et compteurs en
+  C23/POSIX, zéro framework externe — même convention que
+  `tests/test_neuron.c` (`neuron-translator`) et la suite
+  d'`httpfs-translator` ; `make check` est la cible standard, exigée
+  par les critères d'acceptation.
+- **Instance jetable** : la suite crée et détruit sa propre base de
+  test (schéma idempotent, section 6) — aucun test n'écrit dans une
+  base réelle ; ici pas de backend mémoire : c'est PostgreSQL ou
+  rien, dès la phase 1.
+- **Contraintes comme statuts** : doublon de `checksum`, absence de
+  ligne, champ manquant sont testés comme des réponses lisibles
+  (`duplicate`, `empty`, `invalid`), jamais comme des erreurs.
+- **Transaction sur chaque écriture** : à la manière des tests de
+  persistance de `neuron-translator` (fichier tronqué, magie
+  corrompue, octets traînants), un échec en cours de traitement ne
+  doit jamais laisser d'état partiel visible côté `/db`.
+- **Pagination bornée** : lectures paginées vérifiées sur des
+  contenus volumineux générés, mémoire mesurée.
+
 ---
 
 ## 8. Jalons synthétiques
