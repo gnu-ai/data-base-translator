@@ -10,7 +10,14 @@
 
 set -u
 
+# The verification binary speaks the line protocol on stdio: on
+# GNU/Hurd it is built as db-translator-repl (db-translator is
+# the mounted trivfs translator); everywhere else db-translator
+# IS the verification binary.
 BINARY="${1:-../src/db-translator}"
+if [ -z "${1:-}" ] && [ -x ../src/db-translator-repl ]; then
+    BINARY=../src/db-translator-repl
+fi
 FAIL=0
 WORK=""
 

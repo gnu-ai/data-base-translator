@@ -38,13 +38,21 @@ bin_PROGRAMS = db-translator
 # Sur GNU/Hurd, main-hurd.c suit la structure canonique d'un
 # translator trivfs (trivfs_startup puis boucle serveur) et
 # trivfs-hooks.c implémente les trivfs_S_* du protocole de lignes ;
-# ailleurs, main.c construit le même moteur en mode vérification
-# sur les flux standards (même convention que neuron-translator).
+# le binaire de vérification (main.c, le même moteur sur les flux
+# standards) est construit sous le nom db-translator-repl : c'est
+# lui que la suite de tests pilote (make check doit rester vert
+# sous Hurd comme partout).
 if ON_HURD
+bin_PROGRAMS += db-translator-repl
+
 db_translator_SOURCES = trivfs-hooks.c main-hurd.c
 db_translator_CPPFLAGS = $(AM_CPPFLAGS) -DON_HURD $(LIBPQ_CFLAGS)
 db_translator_LDADD = libdbtcore.a -ltrivfs -lfshelp -lports \
                       -lshouldbeinlibc $(LIBPQ_LIBS)
+
+db_translator_repl_SOURCES = main.c
+db_translator_repl_CPPFLAGS = $(AM_CPPFLAGS) $(LIBPQ_CFLAGS)
+db_translator_repl_LDADD = libdbtcore.a $(LIBPQ_LIBS)
 else
 db_translator_SOURCES = main.c
 db_translator_CPPFLAGS = $(AM_CPPFLAGS) $(LIBPQ_CFLAGS)

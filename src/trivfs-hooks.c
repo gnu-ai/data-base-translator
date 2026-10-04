@@ -40,6 +40,16 @@
 
 #if ON_HURD == 1
 
+/* GNU Mach 1.8+git20260224 (the Debian forky/sid snapshot): the
+ * installed mach_host.h uses processor_name_array_t, but no
+ * installed header defines it — the MIG header generation of
+ * this snapshot drops the typedef.  Provide the canonical
+ * definition (an array of processor_info_t) so the Hurd headers
+ * compile; C tolerates the identical redefinition the day the
+ * snapshot is fixed. */
+#include <mach/processor_info.h>
+typedef processor_info_t *processor_name_array_t;
+
 #include <hurd/trivfs.h>
 #include <hurd/fsys.h>
 #include <hurd/hurd_types.h>
@@ -127,6 +137,27 @@ trivfs_goaway (struct trivfs_control *cntl, int flags)
 
   ops_shutdown ();
   exit (0);
+}
+
+/* A truncate (the O_TRUNC of `tee`, of the `>` redirect) arrives
+ * as file_set_size: the default libtrivfs handler ASSERTS when
+ * write support is on, which would kill the translator on the
+ * very first `echo ... | tee /db`.  The node is a protocol
+ * endpoint, not a mutable file: accept the call, change
+ * nothing — the response slot is what it is. */
+kern_return_t
+trivfs_S_file_set_size (struct trivfs_protid *cred,
+                        mach_port_t reply,
+                        mach_msg_type_name_t replytype,
+                        loff_t size)
+{
+  (void) reply;
+  (void) replytype;
+  (void) size;
+
+  if (cred == NULL)
+    return EOPNOTSUPP;
+  return 0;
 }
 
 /* ---------------------------------------------------------------------
