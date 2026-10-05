@@ -40,15 +40,18 @@
 
 #if ON_HURD == 1
 
-/* GNU Mach 1.8+git20260224 (the Debian forky/sid snapshot): the
- * installed mach_host.h uses processor_name_array_t, but no
- * installed header defines it — the MIG header generation of
- * this snapshot drops the typedef.  Provide the canonical
- * definition (an array of processor_info_t) so the Hurd headers
- * compile; C tolerates the identical redefinition the day the
- * snapshot is fixed. */
-#include <mach/processor_info.h>
-typedef processor_info_t *processor_name_array_t;
+/* GNU Mach 1.8+git20260224 (the 2026-03-14 preinstalled image):
+ * its installed headers drop the processor_name_array_t
+ * typedef, so the MIG-generated mach_host.h - and with it
+ * <mach.h> itself - does not compile.  The current ports
+ * package (2:1.8+git20260805-4) carries the typedef in
+ * <mach/mach_types.h> as
+ *   typedef mach_port_t *processor_name_array_t;
+ * Define it the SAME way here: C tolerates the identical
+ * redefinition, so this keeps compiling on fixed systems. */
+
+#include <mach/port.h>                  /* mach_port_t */
+typedef mach_port_t *processor_name_array_t;
 
 #include <hurd/trivfs.h>
 #include <hurd/fsys.h>
